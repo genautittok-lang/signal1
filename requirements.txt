@@ -1,0 +1,7 @@
+ccxt>=3.0.0
+pandas>=1.5
+numpy>=1.22
+python-telegram-bot==13.15
+python-dotenv>=0.21.0
+# optional for charts:
+matplotlib>=3.0.0
