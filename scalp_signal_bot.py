@@ -177,15 +177,39 @@ def bollinger(series: pd.Series, length: int = 20, mult: float = 2.0):
 
 # ----------------- DATA FETCH & UTIL -----------------
 def normalize_symbol(sym: str) -> str:
-    s = sym.strip().upper()
-    s = s.replace(":USDT", "/USDT") if ":USDT" in s else s
-    s = s.replace("//", "/")
+    """
+    Normalize symbol coming from tickers or env:
+    - If symbol contains ':' (e.g. 'BTC/USDT:USDT'), return part before ':' (usually 'BTC/USDT').
+    - Ensure symbol uses '/' separator. If symbol is like 'BTCUSDT' try to convert to 'BTC/USDT'.
+    """
+    s = str(sym).strip()
+    # remove exchange suffix after colon (Bybit returns e.g. 'BTC/USDT:USDT')
+    if ':' in s:
+        s = s.split(':', 1)[0]
+    # if there is no '/' but ends with USDT, try to convert 'BTCUSDT' -> 'BTC/USDT'
+    if '/' not in s and s.upper().endswith('USDT') and len(s) > 4:
+        base = s[:-4]
+        s = f"{base}/{s[-4:]}"
+    # normalize doubles/slashes and uppercase
+    s = s.replace('//', '/').upper()
     return s
 
 
 def fetch_ohlcv_dataframe(symbol: str, timeframe: str, limit: int = OHLCV_LIMIT) -> pd.DataFrame:
     sym = normalize_symbol(symbol)
-    ohlcv = exchange.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+    try:
+        ohlcv = exchange.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+    except Exception as e:
+        # fallback attempts with safer normalized forms
+        logger.debug("Primary fetch failed for %s: %s — trying fallback normalization", sym, e)
+        alt = sym
+        # if contains repeated suffixes, collapse them
+        if alt.count('/USDT') > 1:
+            alt = alt.split('/USDT')[0] + '/USDT'
+        # try symbol part before colon if original had it
+        if ':' in str(symbol):
+            alt = normalize_symbol(str(symbol).split(':', 1)[0])
+        ohlcv = exchange.fetch_ohlcv(alt, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
@@ -194,25 +218,42 @@ def fetch_ohlcv_dataframe(symbol: str, timeframe: str, limit: int = OHLCV_LIMIT)
 
 def get_top_symbols_by_volume(n: int = 50) -> List[str]:
     """
-    Try to get top USDT pairs by 24h quote volume from tickers (best-effort).
-    Falls back to provided SYMBOLS_ENV if set.
+    Get top USDT pairs by 24h quote volume from tickers (best-effort).
+    Uses ticker['symbol'] when available to avoid suffixes like ':USDT'.
     """
     if SYMBOLS_ENV:
-        syms = [s.strip() for s in SYMBOLS_ENV.split(",") if s.strip()]
+        syms = [normalize_symbol(s) for s in SYMBOLS_ENV.split(",") if s.strip()]
         logger.info("Using SYMBOLS from env (count=%d).", len(syms))
         return syms
     try:
         tickers = exchange.fetch_tickers()
-        # tickers is dict symbol -> ticker
         items = []
-        for s, t in tickers.items():
-            # prefer perpetual USDT pairs: end with '/USDT'
-            if "/USDT" not in s:
+        for key, t in tickers.items():
+            # prefer ticker's normalized symbol if available
+            sym = None
+            if isinstance(t, dict):
+                # some ccxt adapters put 'symbol' in ticker dict
+                sym = t.get("symbol") or key
+            else:
+                sym = key
+            sym = normalize_symbol(sym)
+            if "/USDT" not in sym:
                 continue
-            # try to obtain quoteVolume or baseVolume
-            qv = t.get("quoteVolume") or t.get("quoteVolume24h") or t.get("baseVolume") or 0
-            items.append((s, float(qv or 0)))
-        items.sort(key=lambda x: x[1], reverse=True)
+            # try to obtain quoteVolume; fallback to baseVolume
+            qv = 0
+            if isinstance(t, dict):
+                qv = t.get("quoteVolume") or t.get("quoteVolume24h") or t.get("quoteVolume24Hour") or t.get("baseVolume") or 0
+            try:
+                qv = float(qv or 0)
+            except Exception:
+                qv = 0.0
+            items.append((sym, qv))
+        # dedupe by symbol keeping highest volume if duplicates
+        seen = {}
+        for sym, vol in items:
+            if sym not in seen or vol > seen[sym]:
+                seen[sym] = vol
+        items = sorted(seen.items(), key=lambda x: x[1], reverse=True)
         top = [s for s, _ in items[:n]]
         logger.info("Selected top %d symbols by volume.", len(top))
         return top
