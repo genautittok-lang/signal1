@@ -564,7 +564,14 @@ def analyze_symbol(symbol: str, last_signal_times: Dict[str, datetime]) -> Optio
 
     # ensure fresh bar: last timestamp shouldn't be older than 120s (user wanted ~2min fresh)
     latest_bar_ts = df_entry.index[-1]
-    age_sec = (pd.Timestamp.utcnow() - latest_bar_ts).total_seconds()
+    # make both timestamps timezone-aware in UTC to avoid tz-naive vs tz-aware subtraction error
+    latest_bar_ts = pd.Timestamp(latest_bar_ts)
+    if latest_bar_ts.tz is None:
+        latest_bar_ts_utc = latest_bar_ts.tz_localize('UTC')
+    else:
+        latest_bar_ts_utc = latest_bar_ts.tz_convert('UTC')
+    now_utc = pd.Timestamp.utcnow().tz_localize('UTC')
+    age_sec = (now_utc - latest_bar_ts_utc).total_seconds()
     if age_sec > 120:
         logger.info("Skipping %s due to stale data (age %.0fs)", symbol, age_sec)
         return None
